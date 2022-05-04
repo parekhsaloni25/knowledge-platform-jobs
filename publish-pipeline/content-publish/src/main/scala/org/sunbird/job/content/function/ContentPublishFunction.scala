@@ -2,6 +2,7 @@ package org.sunbird.job.content.function
 
 import akka.dispatch.ExecutionContexts
 import com.google.gson.reflect.TypeToken
+import org.apache.commons.lang3.StringUtils
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.streaming.api.functions.ProcessFunction
@@ -16,7 +17,7 @@ import org.sunbird.job.exception.InvalidInputException
 import org.sunbird.job.helper.FailedEventHelper
 import org.sunbird.job.publish.core.{DefinitionConfig, ExtDataConfig, ObjectData}
 import org.sunbird.job.publish.helpers.EcarPackageType
-import org.sunbird.job.util.{CassandraUtil, CloudStorageUtil, HttpUtil, Neo4JUtil}
+import org.sunbird.job.util.{CassandraUtil, CloudStorageUtil, HttpUtil, JSONUtil, Neo4JUtil}
 import org.sunbird.job.{BaseProcessFunction, Metrics}
 
 import java.lang.reflect.Type
@@ -38,7 +39,7 @@ class ContentPublishFunction(config: ContentPublishConfig, httpUtil: HttpUtil,
   private val readerConfig = ExtDataConfig(config.contentKeyspaceName, config.contentTableName)
 
   @transient var ec: ExecutionContext = _
-  private val pkgTypes = List(EcarPackageType.FULL.toString, EcarPackageType.SPINE.toString)
+  private val pkgTypes = List(EcarPackageType.FULL, EcarPackageType.SPINE)
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
@@ -60,7 +61,7 @@ class ContentPublishFunction(config: ContentPublishConfig, httpUtil: HttpUtil,
 
   override def metricsList(): List[String] = {
     List(config.contentPublishEventCount, config.contentPublishSuccessEventCount, config.contentPublishFailedEventCount,
-      config.videoStreamingGeneratorEventCount, config.skippedEventCount)
+      config.videoStreamingGeneratorEventCount, config.skippedEventCount, config.mvProcessorEventCount)
   }
 
   override def processElement(data: Event, context: ProcessFunction[Event, String]#Context, metrics: Metrics): Unit = {
@@ -72,7 +73,7 @@ class ContentPublishFunction(config: ContentPublishConfig, httpUtil: HttpUtil,
         metrics.incCounter(config.skippedEventCount)
         logger.info(s"""pkgVersion should be greater than or equal to the obj.pkgVersion for : ${obj.identifier}""")
       } else {
-        val messages: List[String] = validate(obj, obj.identifier, validateMetadata)
+        val messages: List[String] = validate(obj, obj.identifier, config, validateMetadata)
         if (messages.isEmpty) {
           // Pre-publish update
           updateProcessingNode(new ObjectData(obj.identifier, obj.metadata ++ Map("lastPublishedBy" -> data.lastPublishedBy), obj.extData, obj.hierarchy))(neo4JUtil, cassandraUtil, readerConfig, definitionCache, definitionConfig)
@@ -85,10 +86,12 @@ class ContentPublishFunction(config: ContentPublishConfig, httpUtil: HttpUtil,
           // Clear redis cache
           cache.del(data.identifier)
           val enrichedObj = enrichObject(ecmlVerifiedObj)(neo4JUtil, cassandraUtil, readerConfig, cloudStorageUtil, config, definitionCache, definitionConfig)
-          val objWithEcar = getObjectWithEcar(enrichedObj, if (enrichedObj.metadata.getOrElse("contentDisposition", "").asInstanceOf[String].equalsIgnoreCase("online-only")) List(EcarPackageType.SPINE.toString) else pkgTypes)(ec, cloudStorageUtil, config, definitionCache, definitionConfig, httpUtil)
+          val objectWithPublishChain = getObjectWithPublishChain(data, enrichedObj)
+          val objWithEcar = getObjectWithEcar(objectWithPublishChain, if (enrichedObj.getString("contentDisposition", "").equalsIgnoreCase("online-only")) List(EcarPackageType.SPINE) else pkgTypes)(ec, neo4JUtil, cloudStorageUtil, config, definitionCache, definitionConfig, httpUtil)
           logger.info("Ecar generation done for Content: " + objWithEcar.identifier)
           saveOnSuccess(objWithEcar)(neo4JUtil, cassandraUtil, readerConfig, definitionCache, definitionConfig)
           pushStreamingUrlEvent(enrichedObj, context)(metrics)
+          pushMVCProcessorEvent(enrichedObj, context)(metrics)
           metrics.incCounter(config.contentPublishSuccessEventCount)
           logger.info("Content publishing completed successfully for : " + data.identifier)
         } else {
@@ -134,9 +137,40 @@ class ContentPublishFunction(config: ContentPublishConfig, httpUtil: HttpUtil,
     event
   }
 
+  private def pushMVCProcessorEvent(obj: ObjectData, context: ProcessFunction[Event, String]#Context)(implicit metrics: Metrics): Unit = {
+    if (obj.getString("sourceURL", "").nonEmpty) {
+      val event = getMVCProcessorEvent(obj)
+      context.output(config.mvcProcessorTag, event)
+      metrics.incCounter(config.mvProcessorEventCount)
+    }
+  }
+
+  def getMVCProcessorEvent(obj: ObjectData): String = {
+    val ets = System.currentTimeMillis
+    val mid = s"""LP.$ets.${UUID.randomUUID}"""
+    val channelId = obj.getString("channel", "")
+    val ver = obj.getString("versionKey", "")
+    val artifactUrl = obj.getString("artifactUrl", "")
+    val name = obj.getString("name", "")
+    //TODO: deprecate using contentType in the event.
+    val event = s"""{"eid":"MVC_JOB_PROCESSOR", "ets": $ets, "mid": "$mid", "actor": {"id": "Post Publish Processor", "type": "System"}, "context":{"pdata":{"ver":"1.0","id":"org.sunbird.platform"}, "channel":"$channelId","env":"${config.jobEnv}"},"object":{"ver":"$ver","id":"${obj.identifier}"},"eventData": {"action":"update-es-index","stage":1,"identifier":"${obj.identifier}","channel":"$channelId","artifactUrl":"$artifactUrl","name":"$name"}}""".stripMargin
+    logger.info(s"MVC Processor Event for identifier ${obj.identifier}  is  : $event")
+    event
+  }
+
   private def pushFailedEvent(event: Event, errorMessage: String, error: Throwable, context: ProcessFunction[Event, String]#Context)(implicit metrics: Metrics): Unit = {
     val failedEvent = if (error == null) getFailedEvent(event.jobName, event.getMap(), errorMessage) else getFailedEvent(event.jobName, event.getMap(), error)
     context.output(config.failedEventOutTag, failedEvent)
     metrics.incCounter(config.contentPublishFailedEventCount)
+  }
+
+  def getObjectWithPublishChain(data: Event, obj: ObjectData) : ObjectData = {
+    if (StringUtils.isNotEmpty(data.publishChainMetadata)) {
+      val publishChainMetadata: Map[String, AnyRef] = JSONUtil.deserialize[Map[String, AnyRef]](data.publishChainMetadata)
+      val eData: Map[String, AnyRef] = publishChainMetadata.getOrElse("edata", Map[String, AnyRef]()).asInstanceOf[Map[String, AnyRef]]
+      val publishChain: List[Map[String, AnyRef]] = eData.getOrElse("publishchain", List[Map[String, AnyRef]]()).asInstanceOf[List[Map[String, AnyRef]]]
+      new ObjectData(obj.identifier, obj.metadata ++ Map("publishchain" -> publishChain), obj.extData, obj.hierarchy)
+    }
+    else obj
   }
 }

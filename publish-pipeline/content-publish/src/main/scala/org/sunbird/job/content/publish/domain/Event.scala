@@ -21,9 +21,20 @@ class Event(eventMap: java.util.Map[String, Any], partition: Int, offset: Long) 
 
   def objectType: String = readOrDefault[String]("edata.metadata.objectType", "")
 
+  def contentType: String = readOrDefault[String]("edata.contentType", "")
+
   def publishType: String = readOrDefault[String]("edata.publish_type", "")
 
   def lastPublishedBy: String = readOrDefault[String]("edata.metadata.lastPublishedBy", "")
+
+  def context: Map[String, AnyRef] = readOrDefault("context", Map[String, AnyRef]())
+
+  def obj: Map[String, AnyRef] = readOrDefault("object",Map[String, AnyRef]())
+
+  def publishChain : List[Map[String, AnyRef]]  = readOrDefault("edata.publishchain",List[Map[String, AnyRef]]()).map(m => m.toMap).toList
+
+  def publishChainMetadata : String = readOrDefault[String]("edata.metadata.publishChainMetadata", "");
+
 
   def pkgVersion: Double = {
     val pkgVersion: Number = readOrDefault[Number]("edata.metadata.pkgVersion", 0)
@@ -31,6 +42,8 @@ class Event(eventMap: java.util.Map[String, Any], partition: Int, offset: Long) 
   }
 
   def validEvent(config: ContentPublishConfig): Boolean = {
-    (StringUtils.equals("publish", action) && StringUtils.isNotBlank(identifier)) && (config.supportedObjectType.contains(objectType) && config.supportedMimeType.contains(mimeType))
+    ((StringUtils.equals("publish", action) && StringUtils.isNotBlank(identifier))
+      && (config.supportedObjectType.contains(objectType) && config.supportedMimeType.contains(mimeType))
+      && !StringUtils.equalsIgnoreCase("Asset", contentType))
   }
 }

@@ -3,16 +3,24 @@ package org.sunbird.job.publish.spec
 import akka.dispatch.ExecutionContexts
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.commons.lang3.StringUtils
+import org.junit.Assert.{assertEquals, assertNotNull}
+import org.mockito.Mockito
 import org.scalatest.{BeforeAndAfterAll, FlatSpec, Matchers}
 import org.scalatestplus.mockito.MockitoSugar
+import org.scalatestplus.mockito.MockitoSugar.mock
 import org.sunbird.job.domain.`object`.DefinitionCache
 import org.sunbird.job.exception.InvalidInputException
 import org.sunbird.job.publish.config.PublishConfig
 import org.sunbird.job.publish.core.{DefinitionConfig, ObjectData}
 import org.sunbird.job.publish.helpers.{EcarPackageType, ObjectBundle}
-import org.sunbird.job.util.HttpUtil
+import org.sunbird.job.util.{HttpUtil, ScalaJsonUtil,Neo4JUtil}
 
+
+import java.io.File
+import java.nio.file.{Files, Paths}
+import java.util
 import scala.collection.JavaConverters._
+import scala.collection.mutable.ListBuffer
 import scala.concurrent.ExecutionContextExecutor
 
 class ObjectBundleSpec extends FlatSpec with BeforeAndAfterAll with Matchers with MockitoSugar {
@@ -21,6 +29,7 @@ class ObjectBundleSpec extends FlatSpec with BeforeAndAfterAll with Matchers wit
   val config: Config = ConfigFactory.load("test.conf").withFallback(ConfigFactory.systemEnvironment())
   implicit val publishConfig: PublishConfig = new PublishConfig(config, "")
   //	implicit val cloudStorageUtil: CloudStorageUtil = new CloudStorageUtil(publishConfig)
+  implicit val mockNeo4JUtil: Neo4JUtil = mock[Neo4JUtil](Mockito.withSettings().serializable())
   implicit val ec: ExecutionContextExecutor = ExecutionContexts.global
   val definitionBasePath: String = if (config.hasPath("schema.basePath")) config.getString("schema.basePath") else "https://sunbirddev.blob.core.windows.net/sunbird-content-dev/schemas/local"
   val schemaSupportVersionMap = if (config.hasPath("schema.supportedVersion")) config.getObject("schema.supportedVersion").unwrapped().asScala.toMap else Map[String, AnyRef]()
@@ -97,11 +106,61 @@ class ObjectBundleSpec extends FlatSpec with BeforeAndAfterAll with Matchers wit
     val objList = List(Map[String, AnyRef]("publish_type" -> "public", "mediaType" -> "content", "name" -> "PDF Content edited 1", "streamingUrl" -> "http://google.com/fsdfsdfsdf", "identifier" -> "do_11338246158784921611", "primaryCategory" -> "Explanation Content", "framework" -> "NCF", "versionKey" -> "1633945983008", "mimeType" -> "application/pdf", "license" -> "CC BY 4.0", "contentType" -> "ClassroomTeachingVideo", "objectType" -> "Content", "status" -> "Draft", "lastPublishedBy" -> "anil", "contentDisposition" -> "inline", "previewUrl" -> "http://google.com/fsdfsdfsdf", "artifactUrl" -> "http://google.com/fsdfsdfsdf", "visibility" -> "Default"))
 
     assertThrows[InvalidInputException] {
-      obj.getObjectBundle(data, objList, EcarPackageType.FULL.toString)
+      obj.getObjectBundle(data, objList, EcarPackageType.FULL)
     }
+  }
+
+  "extractPublishChainDataZip" should "should throw IO exception for invalid url" in {
+    val publishChain = "[{\"identifier\":\"do_123\",\"mimeType\":\"application/vnd.sunbird.questionset\",\"objectType\":\"QuestionSet\",\"lastPublishedBy\":\"\",\"pkgVersion\":2,\"state\":\"Processing\",\"downloadUrl\":\"abc.ecar\"}]"
+    val publishChainList: List[Map[String, AnyRef]] = ScalaJsonUtil.deserialize[List[Map[String, AnyRef]]](publishChain)
+
+    val data = new ObjectData("do_123", Map[String, AnyRef]("name" -> "Content Name", "identifier" -> "do_123", "pkgVersion" -> 0.0.asInstanceOf[AnyRef],"publishchain" -> publishChainList), Some(Map[String, AnyRef]("children" -> Map.empty[String,AnyRef])))
+    val obj = new TestObjectBundle
+    assertThrows[NoSuchElementException] {
+      obj.extractPublishChainDataZip(data)
+    }
+  }
+
+  "getPublishChainManifestFileName" should "should generate manifest file name" in {
+    val file = File.createTempFile("file", "manifest.json")
+    val obj = new TestObjectBundle
+    val fileName = obj.getPublishChainFileName(file,"do_2124")
+    assertNotNull(fileName)
+    assertEquals(fileName,"interactions/do_2124/"+file.getName)
+    Files.deleteIfExists(Paths.get(file.getName))
+  }
+
+  "getPublishChainHierarchyFileName" should "should generate hierarchy file name" in {
+    val file = File.createTempFile("file", "hierarchy.json")
+    val obj = new TestObjectBundle
+    val fileName = obj.getPublishChainFileName(file,"do_2124")
+    assertNotNull(fileName)
+    assertEquals(fileName,"interactions/do_2124/"+file.getName)
+    Files.deleteIfExists(Paths.get(file.getName))
+  }
+
+  "getPublishChainFileName" should "should generate file name" in {
+    val file = File.createTempFile("file", "do_2124.zip")
+    val obj = new TestObjectBundle
+    val fileName = obj.getPublishChainFileName(file,"do_2124")
+    assertNotNull(fileName)
+    assertEquals(fileName,"interactions/do_2124/tmp/"+file.getName)
+    Files.deleteIfExists(Paths.get("/tmp/do_2124.txt"))
+  }
+
+  "getByteStream" should "should generate bytes" in {
+    val file = File.createTempFile("file", "manifest.json")
+    var list : ListBuffer[File] = new ListBuffer();
+    var publishChainList : ListBuffer[File] = new ListBuffer();
+    publishChainList+=file
+    var eventMap = new util.HashMap[String, List[File]]()
+    eventMap.put("do_123",publishChainList.toList)
+
+    val obj = new TestObjectBundle
+    val bytes = obj.getByteStream("do_2124",list.toList,eventMap.asScala.toMap)
+    assertNotNull(bytes)
   }
 }
 
 class TestObjectBundle extends ObjectBundle {
-
 }
